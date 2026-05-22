@@ -46,6 +46,7 @@ import SettingsPane from "./settings-pane";
 import DashboardPane from "./dashboard-pane";
 import ClientsPane from "./clients-pane";
 import TemplatesPage from "./templates/page";
+import ContractsPane from "./contracts-pane";
 import EditorPane from "./editor-pane";
 
 // Sanhita — India's largest AI legal research platform.
@@ -92,7 +93,8 @@ type Mode =
   | "settings"
   | "dashboard"
   | "templates"
-  | "editor";
+  | "editor"
+  | "contracts";
 
 interface LanguageOpt {
   code: string;
@@ -170,7 +172,9 @@ const HASH_TO_MODE: Record<string, Mode> = {
   settings: "settings",
   dashboard: "dashboard",
   templates: "templates",
-  editor: "editor",
+  editor: "contracts",
+  contracts: "contracts",
+  drafter: "contracts",
 };
 const MODE_TO_HASH: Record<Mode, string> = {
   assistant: "",
@@ -184,6 +188,7 @@ const MODE_TO_HASH: Record<Mode, string> = {
   dashboard: "dashboard",
   templates: "templates",
   editor: "editor",
+  contracts: "contracts",
 };
 
 export default function AppPage() {
@@ -217,6 +222,31 @@ export default function AppPage() {
   void threads;
   const [activeThread, setActiveThread] = useState<number | null>(null);
   const [messages, setMessages] = useState<Message[]>([]);
+
+  // Active vault document — when set, chat routes to /api/vault/chat
+  const [activeVaultDoc, setActiveVaultDoc] = useState<{ doc_id: number; filename: string; chunks: number } | null>(null);
+
+  // Pinned case from Court Search — when set, every chat message includes
+  // `pinned_case` in the body so the chat-v2 endpoint uses it as [C1].
+  // Also unlocks the 6-button action panel above the composer (Citator,
+  // Find similar, Apply, Distinguish, Draft, Brief).
+  const [pinnedCase, setPinnedCase] = useState<{
+    id: string;
+    title: string;
+    court?: string;
+    year?: number;
+    citation?: string;
+    body_md?: string;
+  } | null>(null);
+  // Inline citator status result (from /api/cases/{id}/status) rendered
+  // under the pinned-case chip when the user clicks the Citator action.
+  const [citatorStatus, setCitatorStatus] = useState<{
+    status: string; color: string; label: string; summary: string;
+    stats: Record<string, number | null>;
+    treating_cases: Array<{ case_id: string; title: string; treatment: string; para_no: number | null; context: string }>;
+  } | null>(null);
+  const [citatorLoading, setCitatorLoading] = useState(false);
+  const [uploadingVault, setUploadingVault] = useState(false);
   const [thinking, setThinking] = useState(false);
   // Live "what's happening right now" phases shown under the answer
   // bubble while we wait for the API. Each phase is a short ChatGPT-style
@@ -355,6 +385,28 @@ export default function AppPage() {
     }
   }, []);
 
+  const handleVaultUpload = useCallback(async (file: File) => {
+    setUploadingVault(true);
+    try {
+      const form = new FormData();
+      form.append("file", file);
+      const r = await fetch("/api/vault/upload", {
+        method: "POST",
+        credentials: "same-origin",
+        body: form,
+      });
+      if (!r.ok) throw new Error(`Upload failed: ${r.status}`);
+      const d = await r.json() as { ok: boolean; doc_id: number; filename: string; chunks: number };
+      if (d.ok) {
+        setActiveVaultDoc({ doc_id: d.doc_id, filename: d.filename, chunks: d.chunks });
+      }
+    } catch (e) {
+      console.error("vault upload failed:", e);
+    } finally {
+      setUploadingVault(false);
+    }
+  }, []);
+
   const handleSend = useCallback(
     async (
       message: string,
@@ -374,17 +426,21 @@ export default function AppPage() {
       setThinking(true);
 
       // Mode routing — Harvey-style action toggles.
+      //   Vault   → /api/vault/chat   (Q&A over uploaded document)
       //   Agent   → /api/brief/agent (Gemini chains tools across turns)
       //   Canvas  → /api/brief/draft  (open drafting, no retrieval)
       //   Search  → /api/brief/web    (real web search + grounded answer)
-      //   else    → /api/brief/chat   (research mode: BM25 + connectors)
-      const endpoint = opts?.agent
+      //   else    → /api/brief/chat-v2 (planner → multi-corpus retrieve →
+      //                synthesiser → answer-gate validator; spans 83M rows)
+      const endpoint = activeVaultDoc && !opts?.agent && !opts?.canvas && !opts?.search
+        ? "/api/vault/chat"
+        : opts?.agent
         ? "/api/brief/agent"
         : opts?.canvas
         ? "/api/brief/draft"
         : opts?.search
         ? "/api/brief/web"
-        : "/api/brief/chat";
+        : "/api/brief/chat-v2";
 
       // Live "thinking" phases — ChatGPT-style status under the bubble.
       // The backend isn't streaming, so we advance through plausible
@@ -457,6 +513,20 @@ export default function AppPage() {
             // chain to put that provider first. Empty string = router
             // default (Gemini Flash).
             prefer: model || undefined,
+            // vault doc routing — only sent when an uploaded doc is active
+            ...(activeVaultDoc ? { doc_id: activeVaultDoc.doc_id } : {}),
+            // pinned case — backend uses it as [C1] anchor + bypasses
+            // retrieval when present (chat-v2 pinned branch).
+            ...(pinnedCase ? {
+              pinned_case: {
+                id: pinnedCase.id,
+                title: pinnedCase.title,
+                court: pinnedCase.court,
+                year: pinnedCase.year,
+                citation: pinnedCase.citation,
+                body_md: pinnedCase.body_md,
+              }
+            } : {}),
           }),
         });
         const data = await r.json();
@@ -509,7 +579,7 @@ export default function AppPage() {
         ]);
       }
     },
-    [activeThread, jurisdiction, source, language, model, newThread]
+    [activeThread, jurisdiction, source, language, model, newThread, activeVaultDoc]
   );
 
   // Persist the language picker value across sessions. Keeping it on the
@@ -579,15 +649,17 @@ export default function AppPage() {
 
         <nav className="px-2 flex flex-col gap-0.5" role="navigation" aria-label="Main navigation">
           <SideItem href="/app" icon={<MessageSquare size={16} />} label="Assistant" active={mode === "assistant"} onClick={() => { setMode("assistant"); setSidebarOpen(false); }} />
-          <SideItem href="/app#vault" icon={<FolderClosed size={16} />} label="Storage" active={mode === "vault"} onClick={() => { setMode("vault"); setSidebarOpen(false); }} />
           <SideItem href="/app#workflows" icon={<Workflow size={16} />} label="Workflows" active={mode === "workflows"} onClick={() => { setMode("workflows"); setSidebarOpen(false); }} />
           <SideItem href="/app#search" icon={<Scale size={16} />} label="Court Search" active={mode === "court-search"} onClick={() => { setMode("court-search"); setSidebarOpen(false); }} />
-          <SideItem href="/app#editor" icon={<FileDown size={16} />} label="Draft Editor" active={mode === "editor"} onClick={() => { setMode("editor"); setSidebarOpen(false); }} />
+          {/* Drafter = template-driven contract / pleading drafter (slots → MD). */}
+          <SideItem href="/app#drafter" icon={<PenLine size={16} />} label="Drafter" active={mode === "contracts"} onClick={() => { setMode("contracts"); setSidebarOpen(false); }} />
+          {/* Editor = free-form rich-text editor (TipTap) for refining drafts,
+              redlining, AI-assist, and Export menu. Workflows' "Send to Editor"
+              lands here via sessionStorage handoff. */}
+          <SideItem href="/app#editor" icon={<FileText size={16} />} label="Editor" active={mode === "editor"} onClick={() => { setMode("editor"); setSidebarOpen(false); }} />
           <SideItem href="/app#clients" icon={<Inbox size={16} />} label="Clients" active={mode === "clients"} onClick={() => { setMode("clients"); setSidebarOpen(false); }} badge={newClientCount > 0 ? newClientCount : undefined} />
           <SideItem href="/app#history" icon={<HistoryIcon size={16} />} label="History" active={mode === "history"} onClick={() => { setMode("history"); setSidebarOpen(false); }} />
-          <SideItem href="/app#library" icon={<LibraryIcon size={16} />} label="Library" active={mode === "library"} onClick={() => { setMode("library"); setSidebarOpen(false); }} />
           <SideItem href="/app#settings" icon={<SettingsIcon size={16} />} label="Settings" active={mode === "settings"} onClick={() => { setMode("settings"); setSidebarOpen(false); }} />
-          <SideItem href="/app#dashboard" icon={<LayoutDashboard size={16} />} label="Dashboard" active={mode === "dashboard"} onClick={() => { setMode("dashboard"); setSidebarOpen(false); }} />
         </nav>
 
         <div className="flex-1" />
@@ -693,6 +765,10 @@ export default function AppPage() {
             suggestions={SUGGESTIONS}
             railOpen={railOpen}
             onCloseRail={() => setRailOpen(false)}
+            activeVaultDoc={activeVaultDoc}
+            uploadingVault={uploadingVault}
+            onVaultUpload={handleVaultUpload}
+            onClearVaultDoc={() => setActiveVaultDoc(null)}
             onOpenInEditor={(content) => {
               if (typeof window !== "undefined") {
                 window.sessionStorage.setItem("editor_draft_content", content);
@@ -705,11 +781,10 @@ export default function AppPage() {
         {mode === "vault" && <VaultPane />}
         {mode === "workflows" && (
           <WorkflowsPane
-            onOpenInEditor={(content, title) => {
+            onOpenInEditor={(content: string) => {
               // Store draft content in sessionStorage for EditorPane to pick up
               if (typeof window !== "undefined") {
                 window.sessionStorage.setItem("editor_draft_content", content);
-                window.sessionStorage.setItem("editor_draft_title", title);
               }
               setMode("editor");
             }}
@@ -721,7 +796,15 @@ export default function AppPage() {
               const tid = activeThread || (await newThread());
               if (!tid) return;
               setMode("assistant");
-              const seed = `Use this case as context:\n\n${c.body_md}\n\nAnalyze this document and help me with: `;
+              // Pin the case for backend grounding + action panel. The
+              // composer chip + 6 action buttons render off `pinnedCase`.
+              setPinnedCase({
+                id: c.case_id || "",
+                title: c.title || "Untitled case",
+                body_md: c.body_md,
+              });
+              setCitatorStatus(null);
+              const seed = `📌 Pinned: **${c.title || "case"}**. Use the action buttons below or ask anything about this case.`;
               setMessages((prev) => [
                 ...prev,
                 { role: "assistant", content: seed },
@@ -786,7 +869,8 @@ export default function AppPage() {
           />
         )}
         {mode === "templates" && <TemplatesPage />}
-        {mode === "editor" && <EditorPane />}
+        {mode === "contracts" && <ContractsPane />}
+        {mode === "editor"   && <EditorPane />}
         {mode === "dashboard" && (
           <DashboardPane
             // "Ask Sanhita" hands the assistant a snapshot of the current
@@ -888,6 +972,10 @@ function AssistantPane({
   railOpen,
   onCloseRail,
   onOpenInEditor,
+  activeVaultDoc,
+  uploadingVault,
+  onVaultUpload,
+  onClearVaultDoc,
 }: {
   messages: Message[];
   thinking: boolean;
@@ -899,8 +987,13 @@ function AssistantPane({
   railOpen: boolean;
   onCloseRail: () => void;
   onOpenInEditor?: (content: string) => void;
+  activeVaultDoc?: { doc_id: number; filename: string; chunks: number } | null;
+  uploadingVault?: boolean;
+  onVaultUpload?: (file: File) => void;
+  onClearVaultDoc?: () => void;
 }) {
   const empty = messages.length === 0;
+  const fileInputRef = useRef<HTMLInputElement>(null);
 
   return (
     // Single-column on phone/tablet (< lg), two-column with permanent rail
@@ -928,6 +1021,148 @@ function AssistantPane({
           className="px-3 sm:px-6 lg:px-12 pt-3 sm:pt-4 border-t border-[var(--line)] bg-[var(--bg)] min-w-0"
           style={{ paddingBottom: "max(0.75rem, env(safe-area-inset-bottom))" }}
         >
+          {/* Hidden file input for vault upload */}
+          <input
+            ref={fileInputRef}
+            type="file"
+            accept=".pdf,.docx,.txt"
+            className="hidden"
+            onChange={(e) => {
+              const f = e.target.files?.[0];
+              if (f && onVaultUpload) onVaultUpload(f);
+              e.target.value = "";
+            }}
+          />
+          {/* Pinned case panel — appears when a Court Search result is
+              pinned. Chip + 6 action buttons (Citator wired; others
+              shipped in subsequent commits). Clicking ✕ unpins. */}
+          {pinnedCase && (
+            <div className="max-w-3xl mx-auto mb-2 space-y-2">
+              <div className="flex items-center gap-2 px-3 py-1.5 rounded-xl bg-blue-50 dark:bg-blue-950/40 border border-blue-200 dark:border-blue-800 text-xs">
+                <span>📌</span>
+                <span className="font-medium truncate min-w-0">{pinnedCase.title}</span>
+                {pinnedCase.citation && (
+                  <span className="text-[var(--ink-soft)] shrink-0">· {pinnedCase.citation}</span>
+                )}
+                <button
+                  onClick={() => { setPinnedCase(null); setCitatorStatus(null); }}
+                  className="ml-auto text-[var(--ink-soft)] hover:text-[var(--ink)] shrink-0"
+                  title="Unpin case"
+                >✕</button>
+              </div>
+
+              {/* 6 action cards. Citator is wired; the other five seed
+                  a pre-baked question into the composer (and the
+                  pinned_case context flows through to backend). */}
+              <div className="flex flex-wrap gap-1.5">
+                <button
+                  onClick={async () => {
+                    if (!pinnedCase.id) return;
+                    setCitatorLoading(true);
+                    setCitatorStatus(null);
+                    try {
+                      const r = await fetch(`/api/cases/${encodeURIComponent(pinnedCase.id)}/status`, { credentials: "same-origin" });
+                      if (r.ok) setCitatorStatus(await r.json());
+                      else setCitatorStatus({ status: "error", color: "grey", label: "Unavailable", summary: `HTTP ${r.status} — citator data not found for this case.`, stats: {}, treating_cases: [] });
+                    } catch (e) {
+                      setCitatorStatus({ status: "error", color: "grey", label: "Unavailable", summary: String(e), stats: {}, treating_cases: [] });
+                    } finally {
+                      setCitatorLoading(false);
+                    }
+                  }}
+                  className="text-xs px-2.5 py-1 rounded-lg border border-[var(--line)] bg-[var(--bg-elev)] hover:bg-[var(--bg-hover)] disabled:opacity-50"
+                  disabled={citatorLoading}
+                >⚖️ Citator{citatorLoading ? "…" : ""}</button>
+                <button
+                  onClick={() => onSend(`Brief this case in 6 bullets: parties, facts, issues, ratio, key citations, outcome.`)}
+                  className="text-xs px-2.5 py-1 rounded-lg border border-[var(--line)] bg-[var(--bg-elev)] hover:bg-[var(--bg-hover)]"
+                >📄 Brief</button>
+                <button
+                  onClick={() => onSend(`Find 5 similar Indian cases to this one, focusing on the same legal issue, with citations.`)}
+                  className="text-xs px-2.5 py-1 rounded-lg border border-[var(--line)] bg-[var(--bg-elev)] hover:bg-[var(--bg-hover)]"
+                >🔍 Similar</button>
+                <button
+                  onClick={() => onSend(`Apply the ratio of this case to my matter. My facts: `)}
+                  className="text-xs px-2.5 py-1 rounded-lg border border-[var(--line)] bg-[var(--bg-elev)] hover:bg-[var(--bg-hover)]"
+                >🎯 Apply</button>
+                <button
+                  onClick={() => onSend(`Distinguish this case from my matter. My facts differ as follows: `)}
+                  className="text-xs px-2.5 py-1 rounded-lg border border-[var(--line)] bg-[var(--bg-elev)] hover:bg-[var(--bg-hover)]"
+                >⚔️ Distinguish</button>
+                <button
+                  onClick={() => onSend(`Draft a 3-paragraph submission using this case as the primary authority. Issue: `)}
+                  className="text-xs px-2.5 py-1 rounded-lg border border-[var(--line)] bg-[var(--bg-elev)] hover:bg-[var(--bg-hover)]"
+                >✍️ Draft</button>
+              </div>
+
+              {/* Citator status panel — only when /status has returned. */}
+              {citatorStatus && (
+                <div className={`rounded-xl border px-3 py-2 text-xs ${
+                  citatorStatus.color === "red" ? "border-red-300 bg-red-50 dark:bg-red-950/30" :
+                  citatorStatus.color === "amber" ? "border-amber-300 bg-amber-50 dark:bg-amber-950/30" :
+                  citatorStatus.color === "green" ? "border-emerald-300 bg-emerald-50 dark:bg-emerald-950/30" :
+                  "border-[var(--line)] bg-[var(--bg-elev)]"
+                }`}>
+                  <div className="flex items-center gap-2 font-medium">
+                    <span>{
+                      citatorStatus.color === "red" ? "🛑" :
+                      citatorStatus.color === "amber" ? "⚠️" :
+                      citatorStatus.color === "green" ? "✅" : "ℹ️"
+                    }</span>
+                    <span>{citatorStatus.label}</span>
+                    <button
+                      onClick={() => setCitatorStatus(null)}
+                      className="ml-auto text-[var(--ink-soft)] hover:text-[var(--ink)]"
+                    >✕</button>
+                  </div>
+                  <div className="mt-1 text-[var(--ink-soft)]">{citatorStatus.summary}</div>
+                  {citatorStatus.treating_cases && citatorStatus.treating_cases.length > 0 && (
+                    <div className="mt-2 space-y-1">
+                      <div className="text-[10px] uppercase tracking-wide text-[var(--ink-soft)]">Treating cases</div>
+                      {citatorStatus.treating_cases.slice(0, 5).map((tc, j) => (
+                        <div key={j} className="flex items-start gap-2">
+                          <span className="text-[10px] px-1.5 py-0.5 rounded bg-[var(--bg)] border border-[var(--line)] shrink-0 mt-0.5">
+                            {tc.treatment}
+                          </span>
+                          <span className="truncate min-w-0">{tc.title || tc.case_id}</span>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              )}
+            </div>
+          )}
+          {/* Active vault doc chip */}
+          {activeVaultDoc && (
+            <div className="max-w-3xl mx-auto mb-2 flex items-center gap-2">
+              <div className="flex-1 flex items-center gap-2 px-3 py-1.5 rounded-xl bg-[var(--accent)]/10 border border-[var(--accent)]/30 text-xs">
+                <span className="text-[var(--accent)]">📄</span>
+                <span className="text-[var(--ink)] font-medium truncate min-w-0">
+                  {activeVaultDoc.filename}
+                </span>
+                <span className="text-[var(--ink-soft)] shrink-0">
+                  · {activeVaultDoc.chunks} chunks · asking from this doc
+                </span>
+                <button
+                  onClick={onClearVaultDoc}
+                  className="ml-auto text-[var(--ink-soft)] hover:text-[var(--ink)] shrink-0"
+                  title="Remove document"
+                >
+                  ✕
+                </button>
+              </div>
+            </div>
+          )}
+          {/* Upload progress */}
+          {uploadingVault && (
+            <div className="max-w-3xl mx-auto mb-2">
+              <div className="flex items-center gap-2 px-3 py-1.5 rounded-xl bg-[var(--bg-elev)] border border-[var(--line)] text-xs text-[var(--ink-soft)]">
+                <div className="w-3 h-3 border-2 border-[var(--accent)] border-t-transparent rounded-full animate-spin shrink-0" />
+                Uploading document…
+              </div>
+            </div>
+          )}
           <div className="max-w-3xl mx-auto min-w-0">
             <PromptInputBox
               onSend={onSend}
