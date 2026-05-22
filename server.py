@@ -39,7 +39,8 @@ from starlette.middleware.base import BaseHTTPMiddleware
 
 # Phase 2 — auth + Brief assistant. Both modules degrade gracefully when
 # optional deps (google-generativeai) aren't installed.
-import auth
+import legacy_auth as auth  # Phase 2: legacy single-file auth lives at legacy_auth.py
+                            # so the new auth/ package can coexist.
 from brief_service import answer_question, answer_conversational, _needs_case_retrieval, serialize_citations, generate_followups
 from validators import input_guards
 from validators.answer_gates import (
@@ -131,6 +132,20 @@ try:
     logger.info("legal-aid router mounted at /api/legal-aid")
 except Exception as _le:
     logger.warning("legal-aid router not loaded: %s", _le)
+
+# Phase 2 auth (signup / OTP / OAuth / sessions / claim). Gated by
+# AUTH_V2_ENABLED so production can roll out behind a flag. See
+# docs/AUTH_DESIGN.md §16.
+try:
+    from auth.deps import auth_v2_enabled
+    if auth_v2_enabled():
+        from auth.routes import router as auth_v2_router
+        app.include_router(auth_v2_router)
+        logger.info("auth_v2 router mounted at /auth")
+    else:
+        logger.info("auth_v2 router NOT mounted (AUTH_V2_ENABLED is false)")
+except Exception as _ae:
+    logger.warning("auth_v2 router not loaded: %s", _ae)
 
 
 class SecurityHeadersMiddleware(BaseHTTPMiddleware):
@@ -1431,6 +1446,141 @@ def api_case_citations(
     return {"stats": stats, "direction": direction, "edges": edges}
 
 
+# ── Citator status — "Is this still good law?" ────────────────────────────
+# Pure-SQL verdict derived from citator_stats + recent citation_edges.
+# Killer Manupatra differentiator: every Indian advocate's first question
+# before relying on a case is "has it been overruled?". No free tool answers
+# this. We do, in <50ms, across 16.9M judgments.
+#
+# Status rubric (docs/CORPUS_FIXES_AND_GROUNDING_PIPELINE.md flow #7):
+#   OVERRULED  — overruled_count > 0                              (red)
+#   QUESTIONED — distinguished_count >= 5 AND followed_count == 0 (amber)
+#   GOOD LAW   — followed_count > 0 OR cited_by_count >= 3        (green)
+#   UNTESTED   — cited_by_count == 0                              (grey)
+#   CITED      — otherwise                                        (neutral)
+@app.get("/api/cases/{case_id}/status")
+def api_case_status(
+    case_id: str,
+    ls_session: Optional[str] = Cookie(default=None),
+):
+    """Return 'Is this still good law?' verdict + supporting edges.
+
+    Response:
+      { status, color, label, summary, stats, treating_cases:[...] }
+    """
+    _require_user(ls_session)
+    idx = _ensure_bm25()
+    if idx is None or not (_FTS5_AVAILABLE and isinstance(idx, FTS5Index)):
+        raise HTTPException(503)
+
+    bare = case_id
+    for prefix in ("doc_", "statute_", "qa_"):
+        if bare.startswith(prefix):
+            bare = bare[len(prefix):]
+            break
+
+    conn = idx.conn
+    row = conn.execute(
+        "SELECT cited_by_count, cites_count, pagerank, distinguished_count, "
+        "overruled_count, followed_count, last_cited_year "
+        "FROM citator_stats WHERE case_id = ?",
+        (bare,),
+    ).fetchone()
+    if not row:
+        cited_by = cites = pr = dist = ovr = fol = 0
+        last_year = None
+    else:
+        cited_by, cites, pr, dist, ovr, fol, last_year = (
+            row[0] or 0, row[1] or 0, row[2] or 0.0,
+            row[3] or 0, row[4] or 0, row[5] or 0, row[6],
+        )
+
+    # Verdict
+    if ovr > 0:
+        status, color, label = "overruled", "red", "Overruled"
+        summary = (
+            f"This case has been overruled in {ovr} subsequent decision"
+            f"{'s' if ovr != 1 else ''}. Do not rely on it without checking "
+            f"the overruling case below."
+        )
+    elif dist >= 5 and fol == 0:
+        status, color, label = "questioned", "amber", "Questioned"
+        summary = (
+            f"This case has been distinguished {dist} times and not yet "
+            f"followed in any later judgment. Treat its ratio with caution."
+        )
+    elif fol > 0 or cited_by >= 3:
+        status, color, label = "good_law", "green", "Good Law"
+        summary = (
+            f"Followed in {fol} later judgment{'s' if fol != 1 else ''} and "
+            f"cited {cited_by} times overall."
+            + (f" Last citation: {last_year}." if last_year else "")
+        )
+    elif cited_by == 0:
+        status, color, label = "untested", "grey", "Untested"
+        summary = "No subsequent judgment has cited this case in our corpus."
+    else:
+        status, color, label = "cited", "neutral", "Cited"
+        summary = f"Cited {cited_by} times in later judgments."
+
+    # Pull the strongest treating cases (priority: overruled > distinguished > followed)
+    treating = []
+    edge_order = (
+        ("overruled", 5), ("set_aside", 5),
+        ("distinguished", 5), ("followed", 5), ("applied", 3), ("cites", 0),
+    )
+    seen = set()
+    for etype, lim in edge_order:
+        if lim == 0:
+            continue
+        for r in conn.execute(
+            """SELECT from_case, citation_norm, para_no, context, edge_type
+               FROM citation_edges
+               WHERE COALESCE(to_case, citation_norm) = ?
+                 AND edge_type = ?
+               ORDER BY edge_id DESC LIMIT ?""",
+            (bare, etype, lim),
+        ).fetchall():
+            fc = r[0] or ""
+            if fc in seen:
+                continue
+            seen.add(fc)
+            # enrich with title
+            title = ""
+            for sql in (
+                "SELECT title FROM judgments WHERE cnr = ? LIMIT 1",
+                "SELECT title FROM legal_docs WHERE doc_id = ? LIMIT 1",
+            ):
+                tr = conn.execute(sql, (fc,)).fetchone()
+                if tr and tr[0]:
+                    title = tr[0]; break
+            treating.append({
+                "case_id": fc,
+                "title": title or (r[1] or ""),
+                "treatment": r[4] or "cites",
+                "para_no": r[2],
+                "context": (r[3] or "")[:280],
+            })
+
+    return {
+        "case_id": bare,
+        "status": status,
+        "color": color,
+        "label": label,
+        "summary": summary,
+        "stats": {
+            "cited_by_count": cited_by,
+            "cites_count": cites,
+            "pagerank": pr,
+            "distinguished_count": dist,
+            "overruled_count": ovr,
+            "followed_count": fol,
+            "last_cited_year": last_year,
+        },
+        "treating_cases": treating,
+    }
+
+
 @app.get("/api/qa/search")
 def api_qa_search(
     q: str = "",
@@ -2412,18 +2562,54 @@ def _require_admin(authorization: Optional[str]) -> None:
 
 def _require_user(session: Optional[str]) -> dict:
     """Dependency-style helper. Returns the authenticated user row or 401.
-    In dev mode (no session cookie), falls back to demo user for preview tools."""
-    uid = auth.verify_session_token(session)
-    if uid is None:
-        # Dev fallback: try demo user (id=1) for preview tools without cookies
-        demo = auth.get_user(1)
-        if demo:
-            return demo
-        raise HTTPException(401, "not signed in")
-    user = auth.get_user(uid)
-    if not user:
-        raise HTTPException(401, "session expired")
-    return user
+
+    Phase 2 (docs/AUTH_DESIGN.md §15) — cookie-format coexistence:
+      - Legacy HMAC-signed `uid.exp.sig` (dots present) → legacy_auth path
+        with access_codes.id as user_id.
+      - New opaque session id (no dots) → auth.session_store + auth.users
+        with users.id as user_id.
+
+    The unconditional demo-user fallback that previously fired on missing
+    cookie is gone — it leaked demo identity to any unauthenticated caller.
+    The replacement is an explicit AUTH_DEV_FALLBACK_EMAIL env var, gated to
+    non-production environments.
+    """
+    if session:
+        if "." in session:
+            # Legacy HMAC-signed cookie. Verify against access_codes table.
+            uid = auth.verify_session_token(session)
+            if uid is not None:
+                user = auth.get_user(uid)
+                if user:
+                    return user
+        else:
+            # New opaque session id. Phase 2 SessionStore lookup.
+            try:
+                from auth.deps import get_session_store
+                from auth import users as _users
+                store = get_session_store()
+                record = store.get(session)
+                if record is not None:
+                    u = _users.get_by_id(record.user_id)
+                    if u is not None and u.is_active:
+                        # Adapt to the legacy "dict with id/email/name" shape so
+                        # downstream callers (threads, vault, editor) keep working.
+                        return {"id": u.id, "email": u.email, "name": u.display_name}
+            except Exception as e:
+                logger.warning("Phase 2 session lookup failed: %s", e)
+
+    fallback_email = os.environ.get("AUTH_DEV_FALLBACK_EMAIL", "")
+    if fallback_email and os.environ.get("APP_ENV", "development") != "production":
+        with auth.db() as c:
+            row = c.execute(
+                "SELECT id, email, name FROM access_codes WHERE LOWER(email) = ? "
+                "AND revoked_at IS NULL",
+                (fallback_email.strip().lower(),),
+            ).fetchone()
+        if row:
+            return dict(row)
+
+    raise HTTPException(401, "not_signed_in")
 
 
 # ── public: access request ─────────────────────────────────────────────────
@@ -3296,78 +3482,91 @@ def api_admin_reject(
     return {"ok": True, "request_id": request_id, "status": "rejected"}
 
 
-# ── HTML page routes for Phase 2 ──────────────────────────────────────────
+# ── Frontend handoff ──────────────────────────────────────────────────────
+# Phase 2 cleanup: the legacy single-file HTML/JS frontend (login.html,
+# brief.html, admin.html, app.js, etc.) is retired in favor of the Next.js
+# app at web/. The backend now serves API + /auth/* only; every legacy page
+# route 302s to the canonical frontend on FRONTEND_ORIGIN (default
+# http://localhost:3000 in dev). Static asset and JS file routes return 404
+# — nothing in the new frontend references them.
 
-@app.get("/login")
-async def serve_login():
-    return FileResponse(STATIC_DIR / "login.html", media_type="text/html")
-
-
-@app.get("/brief")
-async def serve_brief(ls_session: Optional[str] = Cookie(default=None)):
-    # Gate the Brief page — bounce unauthenticated users to /login.
-    uid = auth.verify_session_token(ls_session)
-    if uid is None or auth.get_user(uid) is None:
-        return RedirectResponse(url="/login", status_code=302)
-    return FileResponse(STATIC_DIR / "brief.html", media_type="text/html")
-
-
-@app.get("/brief.js")
-async def serve_brief_js():
-    return FileResponse(STATIC_DIR / "brief.js", media_type="application/javascript")
-
-
-@app.get("/admin")
-async def serve_admin():
-    # Admin page itself is static; the data endpoints are token-gated.
-    return FileResponse(STATIC_DIR / "admin.html", media_type="text/html")
-
-
-# ---------------------------------------------------------------------------
-# Static files
-# ---------------------------------------------------------------------------
 STATIC_DIR = Path(__file__).parent
 
 
-@app.get("/viewer.html")
-async def serve_viewer():
-    return FileResponse(STATIC_DIR / "viewer.html", media_type="text/html")
+def _frontend_origin() -> str:
+    """Where to send users for the UI. In dev defaults to localhost:3000;
+    in production set FRONTEND_ORIGIN to the canonical public URL."""
+    origin = os.environ.get("FRONTEND_ORIGIN", "").strip().rstrip("/")
+    if origin:
+        return origin
+    # Reasonable dev default — what the Next.js `npm run dev` binds to.
+    return "http://localhost:3000"
 
 
-@app.get("/style.css")
-async def serve_css():
-    return FileResponse(STATIC_DIR / "style.css", media_type="text/css")
+def _redirect_to_frontend(path: str = "/") -> RedirectResponse:
+    return RedirectResponse(url=f"{_frontend_origin()}{path}", status_code=302)
 
 
-@app.get("/app.js")
-async def serve_js():
-    return FileResponse(STATIC_DIR / "app.js", media_type="application/javascript")
+# Browser entry points → Next.js. The Next.js app then proxies /api/* and
+# /auth/* back here for data; cookies remain first-party on the frontend
+# origin throughout.
+@app.get("/")
+async def serve_index():
+    return _redirect_to_frontend("/")
 
 
-@app.get("/workspaces.js")
-async def serve_workspaces_js():
-    return FileResponse(STATIC_DIR / "workspaces.js", media_type="application/javascript")
-
-
-@app.get("/app-shell.js")
-async def serve_app_shell_js():
-    return FileResponse(STATIC_DIR / "app-shell.js", media_type="application/javascript")
+@app.get("/login")
+async def serve_login():
+    return _redirect_to_frontend("/login")
 
 
 @app.get("/app")
-async def serve_app(ls_session: Optional[str] = Cookie(default=None)):
-    uid = auth.verify_session_token(ls_session)
-    if uid is None or auth.get_user(uid) is None:
-        return RedirectResponse(url="/login", status_code=302)
-    return FileResponse(STATIC_DIR / "brief.html", media_type="text/html")
+async def serve_app():
+    return _redirect_to_frontend("/app")
 
 
+# Legacy pages were /brief, /admin, /viewer.html. /admin is still useful in
+# theory (token-gated data fetches behind it) but the page itself is gone;
+# point operators at the docs until the dashboard is rebuilt in Next.js.
+@app.get("/brief")
+async def serve_brief_legacy():
+    return _redirect_to_frontend("/app")
+
+
+@app.get("/admin")
+async def serve_admin_legacy():
+    return _redirect_to_frontend("/account/security")
+
+
+@app.get("/viewer.html")
+async def serve_viewer_legacy():
+    return _redirect_to_frontend("/app")
+
+
+# Asset routes that the legacy HTML referenced. The Next.js app does NOT
+# reference these; returning 404 makes any stray legacy bookmark fail loud
+# rather than silently serve stale JS.
+_LEGACY_GONE_PATHS = ("/style.css", "/app.js", "/workspaces.js", "/app-shell.js", "/brief.js")
+
+
+@app.get("/style.css")
+@app.get("/app.js")
+@app.get("/workspaces.js")
+@app.get("/app-shell.js")
+@app.get("/brief.js")
+async def _legacy_assets_gone():
+    raise HTTPException(404, "legacy frontend retired; the Next.js app at FRONTEND_ORIGIN owns the UI")
+
+
+# /assets/* (firm logos, favicon, etc.) is kept ONLY because the PDF
+# proxy templates may embed absolute /assets/ URLs in citation cards. The
+# Next.js app does not depend on it. If you confirm nothing renders these
+# anymore, remove the route entirely.
 @app.get("/assets/{path:path}")
 async def serve_asset(path: str):
     """Serve static assets (logo, firm logos, etc.) from ./assets/."""
     safe_path = (STATIC_DIR / "assets" / path).resolve()
     assets_root = (STATIC_DIR / "assets").resolve()
-    # Prevent path traversal
     if assets_root not in safe_path.parents and safe_path != assets_root:
         raise HTTPException(404, "Not found")
     if not safe_path.is_file():
@@ -3382,12 +3581,3 @@ async def serve_asset(path: str):
         ".ico": "image/x-icon",
     }.get(ext, "application/octet-stream")
     return FileResponse(safe_path, media_type=media)
-
-
-@app.get("/")
-async def serve_index(ls_session: Optional[str] = Cookie(default=None)):
-    # Marketing site removed — go straight to the product.
-    uid = auth.verify_session_token(ls_session)
-    if uid is None or auth.get_user(uid) is None:
-        return RedirectResponse(url="/login", status_code=302)
-    return RedirectResponse(url="/app", status_code=302)
