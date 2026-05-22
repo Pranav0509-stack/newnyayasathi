@@ -246,6 +246,18 @@ export default function AppPage() {
     treating_cases: Array<{ case_id: string; title: string; treatment: string; para_no: number | null; context: string }>;
   } | null>(null);
   const [citatorLoading, setCitatorLoading] = useState(false);
+  // Similar-cases panel (from "Find similar" action). Renders below the
+  // action row when populated. Each row is click-to-repin.
+  const [similarCases, setSimilarCases] = useState<Array<{
+    case_id?: string; doc_id?: string; title?: string; court?: string;
+    year?: number | string; citation?: string; snippet?: string;
+  }> | null>(null);
+  const [similarLoading, setSimilarLoading] = useState(false);
+  // Inline "my facts" composer used by Apply / Distinguish actions —
+  // captures the user's fact scenario, then sends a templated chat
+  // question that grounds against the pinned case.
+  const [factsModal, setFactsModal] = useState<"apply" | "distinguish" | null>(null);
+  const [factsText, setFactsText] = useState("");
   const [uploadingVault, setUploadingVault] = useState(false);
   const [thinking, setThinking] = useState(false);
   // Live "what's happening right now" phases shown under the answer
@@ -1078,22 +1090,170 @@ function AssistantPane({
                   className="text-xs px-2.5 py-1 rounded-lg border border-[var(--line)] bg-[var(--bg-elev)] hover:bg-[var(--bg-hover)]"
                 >📄 Brief</button>
                 <button
-                  onClick={() => onSend(`Find 5 similar Indian cases to this one, focusing on the same legal issue, with citations.`)}
-                  className="text-xs px-2.5 py-1 rounded-lg border border-[var(--line)] bg-[var(--bg-elev)] hover:bg-[var(--bg-hover)]"
-                >🔍 Similar</button>
+                  onClick={async () => {
+                    // Find similar — POST /api/cases/smart-search with the
+                    // pinned case's title; render top 5 inline (excluding
+                    // the pinned case itself). Click a row to re-pin.
+                    setSimilarLoading(true);
+                    setSimilarCases(null);
+                    try {
+                      const r = await fetch("/api/cases/smart-search", {
+                        method: "POST",
+                        credentials: "same-origin",
+                        headers: { "Content-Type": "application/json" },
+                        body: JSON.stringify({ q: pinnedCase.title, mode: "hybrid", limit: 8 }),
+                      });
+                      if (r.ok) {
+                        const d = await r.json();
+                        const hits = (d.hits || []).filter((h: { case_id?: string; doc_id?: string }) =>
+                          (h.case_id || h.doc_id) !== pinnedCase.id).slice(0, 5);
+                        setSimilarCases(hits);
+                      } else {
+                        setSimilarCases([]);
+                      }
+                    } catch {
+                      setSimilarCases([]);
+                    } finally {
+                      setSimilarLoading(false);
+                    }
+                  }}
+                  className="text-xs px-2.5 py-1 rounded-lg border border-[var(--line)] bg-[var(--bg-elev)] hover:bg-[var(--bg-hover)] disabled:opacity-50"
+                  disabled={similarLoading}
+                >🔍 Similar{similarLoading ? "…" : ""}</button>
                 <button
-                  onClick={() => onSend(`Apply the ratio of this case to my matter. My facts: `)}
+                  onClick={() => { setFactsModal("apply"); setFactsText(""); }}
                   className="text-xs px-2.5 py-1 rounded-lg border border-[var(--line)] bg-[var(--bg-elev)] hover:bg-[var(--bg-hover)]"
                 >🎯 Apply</button>
                 <button
-                  onClick={() => onSend(`Distinguish this case from my matter. My facts differ as follows: `)}
+                  onClick={() => { setFactsModal("distinguish"); setFactsText(""); }}
                   className="text-xs px-2.5 py-1 rounded-lg border border-[var(--line)] bg-[var(--bg-elev)] hover:bg-[var(--bg-hover)]"
                 >⚔️ Distinguish</button>
                 <button
-                  onClick={() => onSend(`Draft a 3-paragraph submission using this case as the primary authority. Issue: `)}
+                  onClick={() => {
+                    // Hand the pinned case off to the Drafter via
+                    // sessionStorage. ContractsPane reads this key on
+                    // mount and pre-populates the exhibits sidebar.
+                    try {
+                      // Reuse the existing key ContractsPane already reads
+                      // on mount (sanhita.drafter.seed). Shape matches its
+                      // seedFromSearch state.
+                      sessionStorage.setItem(
+                        "sanhita.drafter.seed",
+                        JSON.stringify({
+                          case_id: pinnedCase.id,
+                          title: pinnedCase.title,
+                          summary: (pinnedCase.body_md || "").slice(0, 800),
+                        })
+                      );
+                    } catch {/* sessionStorage may be unavailable */}
+                    setMode("contracts");
+                  }}
                   className="text-xs px-2.5 py-1 rounded-lg border border-[var(--line)] bg-[var(--bg-elev)] hover:bg-[var(--bg-hover)]"
                 >✍️ Draft</button>
               </div>
+
+              {/* Similar cases — populated by the 🔍 action. Click a row to
+                  switch the pin to that case (so all 6 actions re-target it). */}
+              {similarCases !== null && (
+                <div className="rounded-xl border border-[var(--line)] bg-[var(--bg-elev)] px-3 py-2 text-xs">
+                  <div className="flex items-center gap-2 font-medium">
+                    <span>🔍</span>
+                    <span>Similar cases</span>
+                    <button
+                      onClick={() => setSimilarCases(null)}
+                      className="ml-auto text-[var(--ink-soft)] hover:text-[var(--ink)]"
+                    >✕</button>
+                  </div>
+                  {similarCases.length === 0 ? (
+                    <div className="mt-1 text-[var(--ink-soft)]">No similar cases found.</div>
+                  ) : (
+                    <div className="mt-2 space-y-1.5">
+                      {similarCases.map((sc, j) => {
+                        const sid = sc.case_id || sc.doc_id || "";
+                        return (
+                          <button
+                            key={j}
+                            onClick={() => {
+                              setPinnedCase({
+                                id: sid,
+                                title: sc.title || "Untitled",
+                                body_md: sc.snippet || "",
+                              });
+                              setSimilarCases(null);
+                              setCitatorStatus(null);
+                            }}
+                            className="w-full text-left px-2 py-1.5 rounded-md hover:bg-[var(--bg-hover)] border border-transparent hover:border-[var(--line)]"
+                          >
+                            <div className="font-medium truncate">{sc.title || sid}</div>
+                            <div className="text-[10px] text-[var(--ink-soft)] truncate">
+                              {[sc.court, sc.year, sc.citation].filter(Boolean).join(" · ")}
+                            </div>
+                            {sc.snippet && (
+                              <div className="text-[var(--ink-soft)] text-[11px] line-clamp-2 mt-0.5">
+                                {sc.snippet}
+                              </div>
+                            )}
+                          </button>
+                        );
+                      })}
+                    </div>
+                  )}
+                </div>
+              )}
+
+              {/* Apply / Distinguish facts modal — pops below the action
+                  row, captures user's facts, then sends a templated chat
+                  question with pinned_case body in scope. */}
+              {factsModal && (
+                <div className="rounded-xl border border-[var(--accent)]/40 bg-[var(--bg-elev)] px-3 py-2 text-xs space-y-2">
+                  <div className="flex items-center gap-2 font-medium">
+                    <span>{factsModal === "apply" ? "🎯" : "⚔️"}</span>
+                    <span>{factsModal === "apply" ? "Apply this case to your facts" : "Distinguish this case from your facts"}</span>
+                    <button
+                      onClick={() => { setFactsModal(null); setFactsText(""); }}
+                      className="ml-auto text-[var(--ink-soft)] hover:text-[var(--ink)]"
+                    >✕</button>
+                  </div>
+                  <textarea
+                    value={factsText}
+                    onChange={(e) => setFactsText(e.target.value)}
+                    placeholder="Briefly describe your client's facts (parties, what happened, what you want to argue)…"
+                    rows={3}
+                    autoFocus
+                    className="w-full px-2 py-1.5 rounded-md border border-[var(--line)] bg-[var(--bg)] resize-y"
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter" && (e.metaKey || e.ctrlKey) && factsText.trim()) {
+                        const verb = factsModal === "apply"
+                          ? `Apply the ratio of "${pinnedCase.title}" to these facts and produce a 4-step legal opinion (issue, rule, application, conclusion).`
+                          : `Distinguish "${pinnedCase.title}" from these facts. Identify 3 material differences and explain why each weakens the precedent's application.`;
+                        const q = `${verb}\n\nMy facts: ${factsText.trim()}`;
+                        onSend(q);
+                        setFactsModal(null);
+                        setFactsText("");
+                      }
+                    }}
+                  />
+                  <div className="flex items-center justify-between">
+                    <span className="text-[10px] text-[var(--ink-soft)]">⌘/Ctrl + Enter to send</span>
+                    <button
+                      onClick={() => {
+                        if (!factsText.trim()) return;
+                        const verb = factsModal === "apply"
+                          ? `Apply the ratio of "${pinnedCase.title}" to these facts and produce a 4-step legal opinion (issue, rule, application, conclusion).`
+                          : `Distinguish "${pinnedCase.title}" from these facts. Identify 3 material differences and explain why each weakens the precedent's application.`;
+                        const q = `${verb}\n\nMy facts: ${factsText.trim()}`;
+                        onSend(q);
+                        setFactsModal(null);
+                        setFactsText("");
+                      }}
+                      disabled={!factsText.trim()}
+                      className="px-2.5 py-1 rounded-md bg-[var(--accent)] text-white disabled:opacity-50 text-[11px] font-medium"
+                    >
+                      {factsModal === "apply" ? "Apply" : "Distinguish"}
+                    </button>
+                  </div>
+                </div>
+              )}
 
               {/* Citator status panel — only when /status has returned. */}
               {citatorStatus && (
